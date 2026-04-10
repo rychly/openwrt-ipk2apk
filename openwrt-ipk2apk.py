@@ -9,7 +9,7 @@ import re
 import hashlib
 import gzip
 import io
-from typing import Dict
+from typing import Dict, List
 
 
 def parse_control_file(control_path: str) -> Dict[str, str]:
@@ -35,14 +35,20 @@ def parse_control_file(control_path: str) -> Dict[str, str]:
     return metadata
 
 
-def format_dependencies(depends_str: str) -> list[str]:
+def format_dependencies(depends_str: str) -> List[str]:
     """Removes version constraints and returns a list of dependency names for APK."""
     if not depends_str:
         return []
-    # Remove version constraints in parentheses, e.g., (>= 1.0)
-    depends_clean = re.sub(r"\(.*?\)", "", depends_str)
-    # Split by commas or spaces and filter out empty strings
-    return [d.strip() for d in depends_clean.replace(",", " ").split() if d.strip()]
+    result = []
+    for dep_expr in depends_str.split(","):
+        # Remove version constraints in parentheses, e.g., (>= 1.0)
+        dep_expr = re.sub(r"\(.*?\)", "", dep_expr)
+        # Split on '|' for alternatives, strip whitespace from each part
+        alternatives = [a.strip() for a in dep_expr.split("|")]
+        alternatives = [a for a in alternatives if a]
+        if alternatives:
+            result.append("|".join(alternatives))
+    return result
 
 
 def get_directory_size(path: str) -> int:
