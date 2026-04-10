@@ -9,38 +9,48 @@ import re
 import hashlib
 import gzip
 import io
+from typing import Dict, List
 
 
-def parse_control_file(control_path):
+def parse_control_file(control_path: str) -> Dict[str, str]:
     """Parses the IPK control file into a metadata dictionary."""
-    metadata = {}
+    metadata: Dict[str, str] = {}
     with open(control_path, "r", encoding="utf-8") as f:
         key = None
         for line in f:
+            # Check for continuation lines BEFORE stripping: in Debian/IPK
+            # control format, continuation lines start with whitespace.
+            if line.startswith((" ", "\t")) and key:
+                # Handle multi-line values (like Description)
+                metadata[key] += f" {line.strip()}"
+                continue
             line = line.strip()
             if not line:
+                key = None
                 continue
             if ":" in line:
                 key, value = line.split(":", 1)
-                metadata[key.strip()] = value.strip()
-            elif key:
-                # Handle multi-line values (like Description)
-                metadata[key] += f" {line}"
+                key = key.strip()
+                metadata[key] = value.strip()
     return metadata
 
 
-def format_dependencies(depends_str):
-    """Removes version constraints and formats dependencies for APK."""
+def format_dependencies(depends_str: str) -> List[str]:
+    """Removes version constraints and returns a list of dependency names for APK."""
     if not depends_str:
-        return ""
-    # Remove version constraints in parentheses, e.g., (>= 1.0)
-    depends_clean = re.sub(r"\(.*?\)", "", depends_str)
-    # Split by commas or spaces and filter out empty strings
-    deps = [d.strip() for d in depends_clean.replace(",", " ").split() if d.strip()]
-    return " ".join(deps)
+        return []
+    result = []
+    for dep_expr in depends_str.split(","):
+        # Remove version constraints in parentheses, e.g., (>= 1.0)
+        dep_expr = re.sub(r"\(.*?\)", "", dep_expr)
+        # Split on '|' for alternatives, strip whitespace from each part
+        alternatives = [a.strip() for a in dep_expr.split("|") if a.strip()]
+        if alternatives:
+            result.append("|".join(alternatives))
+    return result
 
 
-def get_directory_size(path):
+def get_directory_size(path: str) -> int:
     """Calculates the total uncompressed size of all files in a directory."""
     total_size = 0
     for dirpath, _, filenames in os.walk(path):
@@ -51,7 +61,7 @@ def get_directory_size(path):
     return total_size
 
 
-def calculate_sha256(filepath):
+def calculate_sha256(filepath: str) -> str:
     """Calculates the SHA-256 checksum of a file."""
     sha256 = hashlib.sha256()
     with open(filepath, "rb") as f:
@@ -60,7 +70,9 @@ def calculate_sha256(filepath):
     return sha256.hexdigest()
 
 
-def create_pkginfo_content(metadata, data_size, data_hash):
+def create_pkginfo_content(
+    metadata: Dict[str, str], data_size: int, data_hash: str
+) -> str:
     """Generates the required text content for the .PKGINFO file."""
     pkginfo = [
         f"pkgname = {metadata.get('Package', 'unknown')}",
@@ -74,14 +86,14 @@ def create_pkginfo_content(metadata, data_size, data_hash):
     if "Maintainer" in metadata:
         pkginfo.append(f"maintainer = {metadata['Maintainer']}")
     if "Depends" in metadata:
-        apk_deps = format_dependencies(metadata["Depends"])
-        if apk_deps:
-            pkginfo.append(f"depend = {apk_deps}")
+        # APK requires one "depend = <name>" line per dependency
+        for dep in format_dependencies(metadata["Depends"]):
+            pkginfo.append(f"depend = {dep}")
 
     return "\n".join(pkginfo) + "\n"
 
 
-def inject_files_with_pax_checksums(tar, src_dir):
+def inject_files_with_pax_checksums(tar: tarfile.TarFile, src_dir: str) -> None:
     """
     Traverses a directory and adds files to a tar archive.
     Critically, it calculates the SHA1 hash for every regular file and
@@ -112,10 +124,7 @@ def inject_files_with_pax_checksums(tar, src_dir):
             if info.isfile():
                 sha1 = hashlib.sha1()
                 with open(full_path, "rb") as f_in:
-                    while True:
-                        chunk = f_in.read(65536)
-                        if not chunk:
-                            break
+                    for chunk in iter(lambda: f_in.read(65536), b""):
                         sha1.update(chunk)
 
                 # Core APK requirement: store hash in PAX extended header
@@ -128,7 +137,7 @@ def inject_files_with_pax_checksums(tar, src_dir):
                 tar.addfile(info)
 
 
-def convert_package(ipk_file, apk_file):
+def convert_package(ipk_file: str, apk_file: str) -> None:
     print(f"[*] Extracting IPK: {ipk_file}")
 
     # Dynamically handle Python 3.12+ tarfile extraction filters (PEP 706)
@@ -139,12 +148,22 @@ def convert_package(ipk_file, apk_file):
         try:
             with tarfile.open(ipk_file, "r:gz") as ipk:
                 ipk.extractall(path=tmpdir, **extract_kwargs)
-        except tarfile.ReadError:
-            print("[!] Error: The source file is not a valid tar.gz archive.")
-            sys.exit(1)
+        except tarfile.ReadError as e:
+            raise ValueError(
+                "The source file is not a valid tar.gz archive."
+            ) from e
 
         control_tar_path = os.path.join(tmpdir, "control.tar.gz")
         orig_data_tar_path = os.path.join(tmpdir, "data.tar.gz")
+
+        for required_path, name in [
+            (control_tar_path, "control.tar.gz"),
+            (orig_data_tar_path, "data.tar.gz"),
+        ]:
+            if not os.path.exists(required_path):
+                raise FileNotFoundError(
+                    f"Expected member '{name}' not found in the IPK archive."
+                )
 
         # ==========================================
         # STEP 1: Process IPK Metadata
@@ -154,7 +173,12 @@ def convert_package(ipk_file, apk_file):
         with tarfile.open(control_tar_path, "r:gz") as c_tar:
             c_tar.extractall(path=control_dir, **extract_kwargs)
 
-        control_meta = parse_control_file(os.path.join(control_dir, "control"))
+        control_file = os.path.join(control_dir, "control")
+        if not os.path.exists(control_file):
+            raise FileNotFoundError(
+                "Expected 'control' file not found in control.tar.gz."
+            )
+        control_meta = parse_control_file(control_file)
 
         # ==========================================
         # STEP 2: Process Data Stream
@@ -257,4 +281,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     target_path = args.output if args.output else source_path.rsplit(".", 1)[0] + ".apk"
-    convert_package(source_path, target_path)
+    try:
+        convert_package(source_path, target_path)
+    except (ValueError, FileNotFoundError) as e:
+        print(f"[!] Error: {e}")
+        sys.exit(1)
