@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import tarfile
+import tempfile
+import argparse
+import re
+import hashlib
+import gzip
+import io
+
+
+def parse_control_file(control_path):
+    """Parses the IPK control file into a metadata dictionary."""
+    metadata = {}
+    with open(control_path, "r", encoding="utf-8") as f:
+        key = None
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if ":" in line:
+                key, value = line.split(":", 1)
+                metadata[key.strip()] = value.strip()
+            elif key:
+                # Handle multi-line values (like Description)
+                metadata[key] += f" {line}"
+    return metadata
+
+
+def format_dependencies(depends_str):
+    """Removes version constraints and formats dependencies for APK."""
+    if not depends_str:
+        return ""
+    # Remove version constraints in parentheses, e.g., (>= 1.0)
+    depends_clean = re.sub(r"\(.*?\)", "", depends_str)
+    # Split by commas or spaces and filter out empty strings
+    deps = [d.strip() for d in depends_clean.replace(",", " ").split() if d.strip()]
+    return " ".join(deps)
+
+
+def get_directory_size(path):
+    """Calculates the total uncompressed size of all files in a directory."""
+    total_size = 0
+    for dirpath, _, filenames in os.walk(path):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            if not os.path.islink(fp):
+                total_size += os.path.getsize(fp)
+    return total_size
+
+
+def calculate_sha256(filepath):
+    """Calculates the SHA-256 checksum of a file."""
+    sha256 = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for byte_block in iter(lambda: f.read(65536), b""):
+            sha256.update(byte_block)
+    return sha256.hexdigest()
+
+
+def create_pkginfo_content(metadata, data_size, data_hash):
+    """Generates the required text content for the .PKGINFO file."""
+    pkginfo = [
+        f"pkgname = {metadata.get('Package', 'unknown')}",
+        f"pkgver = {metadata.get('Version', '1.0.0')}",
+        f"pkgdesc = {metadata.get('Description', 'Converted from IPK')}",
+        f"arch = {metadata.get('Architecture', 'unknown')}",
+        f"size = {data_size}",
+        f"datahash = {data_hash}",
+    ]
+
+    if "Maintainer" in metadata:
+        pkginfo.append(f"maintainer = {metadata['Maintainer']}")
+    if "Depends" in metadata:
+        apk_deps = format_dependencies(metadata["Depends"])
+        if apk_deps:
+            pkginfo.append(f"depend = {apk_deps}")
+
+    return "\n".join(pkginfo) + "\n"
+
+
+def inject_files_with_pax_checksums(tar, src_dir):
+    """
+    Traverses a directory and adds files to a tar archive.
+    Critically, it calculates the SHA1 hash for every regular file and
+    injects it into the tar archive via the APK-TOOLS PAX extended header.
+    """
+    for root, dirs, files in os.walk(src_dir):
+        # Ensure deterministic ordering
+        dirs.sort()
+        files.sort()
+
+        # Add directories
+        for d in dirs:
+            full_path = os.path.join(root, d)
+            arcname = os.path.relpath(full_path, src_dir)
+            info = tar.gettarinfo(full_path, arcname)
+            info.uid = info.gid = 0
+            info.uname = info.gname = "root"
+            tar.addfile(info)
+
+        # Add files with SHA1 injection
+        for f in files:
+            full_path = os.path.join(root, f)
+            arcname = os.path.relpath(full_path, src_dir)
+            info = tar.gettarinfo(full_path, arcname)
+            info.uid = info.gid = 0
+            info.uname = info.gname = "root"
+
+            if info.isfile():
+                sha1 = hashlib.sha1()
+                with open(full_path, "rb") as f_in:
+                    while True:
+                        chunk = f_in.read(65536)
+                        if not chunk:
+                            break
+                        sha1.update(chunk)
+
+                # Core APK requirement: store hash in PAX extended header
+                info.pax_headers = {"APK-TOOLS.checksum.SHA1": sha1.hexdigest()}
+
+                with open(full_path, "rb") as f_in:
+                    tar.addfile(info, f_in)
+            else:
+                # Symlinks and special files do not require checksums
+                tar.addfile(info)
+
+
+def convert_package(ipk_file, apk_file):
+    print(f"[*] Extracting IPK: {ipk_file}")
+
+    # Dynamically handle Python 3.12+ tarfile extraction filters (PEP 706)
+    # to avoid DeprecationWarnings while maintaining backward compatibility.
+    extract_kwargs = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            with tarfile.open(ipk_file, "r:gz") as ipk:
+                ipk.extractall(path=tmpdir, **extract_kwargs)
+        except tarfile.ReadError:
+            print("[!] Error: The source file is not a valid tar.gz archive.")
+            sys.exit(1)
+
+        control_tar_path = os.path.join(tmpdir, "control.tar.gz")
+        orig_data_tar_path = os.path.join(tmpdir, "data.tar.gz")
+
+        # ==========================================
+        # STEP 1: Process IPK Metadata
+        # ==========================================
+        control_dir = os.path.join(tmpdir, "control_ext")
+        os.makedirs(control_dir, exist_ok=True)
+        with tarfile.open(control_tar_path, "r:gz") as c_tar:
+            c_tar.extractall(path=control_dir, **extract_kwargs)
+
+        control_meta = parse_control_file(os.path.join(control_dir, "control"))
+
+        # ==========================================
+        # STEP 2: Process Data Stream
+        # ==========================================
+        data_dir = os.path.join(tmpdir, "data_ext")
+        os.makedirs(data_dir, exist_ok=True)
+        with tarfile.open(orig_data_tar_path, "r:gz") as d_tar:
+            d_tar.extractall(path=data_dir, **extract_kwargs)
+
+        data_size = get_directory_size(data_dir)
+        new_data_gz_path = os.path.join(tmpdir, "new_data.tar.gz")
+
+        print("[*] Generating data stream (with SHA1 PAX headers)...")
+        # Data segment MUST be PAX_FORMAT for extended headers to work
+        with gzip.GzipFile(new_data_gz_path, "wb", mtime=0) as gz:
+            with tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as d_tar:
+                inject_files_with_pax_checksums(d_tar, data_dir)
+
+        data_hash = calculate_sha256(new_data_gz_path)
+
+        # ==========================================
+        # STEP 3: Process Control Stream
+        # ==========================================
+        pkginfo_content = create_pkginfo_content(control_meta, data_size, data_hash)
+        control_tar_buffer = io.BytesIO()
+
+        # Control segment MUST be GNU_FORMAT (no PAX headers allowed here).
+        # This ensures .PKGINFO is physically the first file without any hidden pax blocks.
+        with tarfile.open(
+            fileobj=control_tar_buffer, mode="w", format=tarfile.GNU_FORMAT
+        ) as c_tar:
+
+            # Add .PKGINFO first
+            info = tarfile.TarInfo(".PKGINFO")
+            pkginfo_bytes = pkginfo_content.encode("utf-8")
+            info.size = len(pkginfo_bytes)
+            info.uid = info.gid = 0
+            info.uname = info.gname = "root"
+            info.mode = 0o644
+            c_tar.addfile(info, io.BytesIO(pkginfo_bytes))
+
+            # Map install scripts from IPK format to APK format
+            script_map = {
+                "preinst": ".pre-install",
+                "postinst": ".post-install",
+                "prerm": ".pre-deinstall",
+                "postrm": ".post-deinstall",
+            }
+
+            for item in sorted(os.listdir(control_dir)):
+                if item in script_map:
+                    item_path = os.path.join(control_dir, item)
+                    arcname = script_map[item]
+                    info = c_tar.gettarinfo(item_path, arcname)
+                    info.uid = info.gid = 0
+                    info.uname = info.gname = "root"
+
+                    with open(item_path, "rb") as f_in:
+                        c_tar.addfile(info, f_in)
+
+            # MAGIC: Capture the exact stream length before EOF null blocks are added by tarfile
+            valid_tar_length = c_tar.offset
+
+        # Truncate the EOF null blocks to allow proper stream chaining
+        tar_data_truncated = control_tar_buffer.getvalue()[:valid_tar_length]
+
+        new_control_gz_path = os.path.join(tmpdir, "new_control.tar.gz")
+        print(
+            "[*] Generating control stream (strict GNU_FORMAT, stripping EOF blocks)..."
+        )
+        with gzip.GzipFile(new_control_gz_path, "wb", mtime=0) as gz:
+            gz.write(tar_data_truncated)
+
+        # ==========================================
+        # STEP 4: Final Assembly (Concatenation)
+        # ==========================================
+        print(f"[*] Concatenating streams into: {apk_file}")
+        with open(apk_file, "wb") as apk:
+            with open(new_control_gz_path, "rb") as c:
+                apk.write(c.read())
+            with open(new_data_gz_path, "rb") as d:
+                apk.write(d.read())
+
+    print("[+] Conversion completed successfully!")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Converts an OpenWrt .ipk package into a strict Alpine/OpenWrt .apk v2 package."
+    )
+    parser.add_argument("ipk_file", help="Path to the source .ipk file")
+    parser.add_argument(
+        "-o", "--output", help="Optional output path for the .apk file", default=None
+    )
+    args = parser.parse_args()
+
+    source_path = args.ipk_file
+    if not os.path.exists(source_path):
+        print(f"[!] Error: Source file '{source_path}' does not exist.")
+        sys.exit(1)
+
+    target_path = args.output if args.output else source_path.rsplit(".", 1)[0] + ".apk"
+    convert_package(source_path, target_path)
