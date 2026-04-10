@@ -35,16 +35,48 @@ def parse_control_file(control_path: str) -> Dict[str, str]:
     return metadata
 
 
+def _apk_dep_constraint(dep: str) -> str:
+    """Converts a single IPK dependency token to APK notation.
+
+    IPK/Debian uses parenthesised operators, e.g., 'pkg (>= 1.0)'.
+    APK uses inline operators without parentheses, e.g., 'pkg>=1.0'.
+
+    Operator mapping:
+      (= ver)  -> =ver   (exact)
+      (>= ver) -> >=ver
+      (<= ver) -> <=ver
+      (>> ver) -> >ver   (Debian strict-greater)
+      (<< ver) -> <ver   (Debian strict-less)
+      (> ver)  -> >ver   (OpenWrt style)
+      (< ver)  -> <ver   (OpenWrt style)
+    """
+    dep = dep.strip()
+    match = re.match(
+        r"^(\S+)\s*\(\s*(=|>=|<=|>>|<<|>|<)\s*([^)]+)\)$", dep
+    )
+    if not match:
+        return dep
+    pkg, op, ver = match.group(1).strip(), match.group(2), match.group(3).strip()
+    # Normalise Debian strict operators to their APK equivalents
+    apk_op = {">>": ">", "<<": "<"}.get(op, op)
+    return f"{pkg}{apk_op}{ver}"
+
+
 def format_dependencies(depends_str: str) -> List[str]:
-    """Removes version constraints and returns a list of dependency names for APK."""
+    """Converts IPK dependency expressions to APK notation.
+
+    Version constraints are translated to APK's inline format (e.g.,
+    'libssl (>= 1.1)' becomes 'libssl>=1.1').  OR-alternatives ('|') are
+    preserved.  Each comma-separated entry becomes one list element.
+    """
     if not depends_str:
         return []
     result = []
     for dep_expr in depends_str.split(","):
-        # Remove version constraints in parentheses, e.g., (>= 1.0)
-        dep_expr = re.sub(r"\(.*?\)", "", dep_expr)
-        # Split on '|' for alternatives, strip whitespace from each part
-        alternatives = [a.strip() for a in dep_expr.split("|") if a.strip()]
+        # Split on '|' for alternatives, convert each token individually
+        alternatives = [
+            _apk_dep_constraint(a) for a in dep_expr.split("|") if a.strip()
+        ]
         if alternatives:
             result.append("|".join(alternatives))
     return result
