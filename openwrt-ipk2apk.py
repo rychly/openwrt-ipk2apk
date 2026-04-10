@@ -86,8 +86,9 @@ def format_provides(provides_str: str) -> List[str]:
     """Converts IPK Provides into APK provides format.
 
     APK supports versioned provides using '=' only (e.g., 'libfoo=1.0').
-    Exact-version constraints '(= <ver>)' are converted to that form;
-    all other version constraints are stripped.
+    Exact-version constraints '(= <ver>)' are converted to that form via
+    _apk_dep_constraint(); all other version constraints are stripped because
+    APK does not support range operators in 'provides'.
     """
     if not provides_str:
         return []
@@ -96,15 +97,12 @@ def format_provides(provides_str: str) -> List[str]:
         item = item.strip()
         if not item:
             continue
-        # Convert exact-version constraint: foo (= 1.0) -> foo=1.0
-        match = re.match(r"^(\S+)\s*\(=\s*([^)]+)\)$", item)
-        if match:
-            result.append(f"{match.group(1).strip()}={match.group(2).strip()}")
-        else:
-            # Strip any other version constraints, e.g., (>= 1.0)
-            item = re.sub(r"\s*\(.*?\)", "", item).strip()
-            if item:
-                result.append(item)
+        converted = _apk_dep_constraint(item)
+        # APK provides only support exact '=' version constraints; drop ranges
+        if re.search(r"[<>]", converted):
+            converted = re.sub(r"[<>].*$", "", converted).strip()
+        if converted:
+            result.append(converted)
     return result
 
 
