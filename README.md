@@ -7,7 +7,7 @@ As OpenWrt transitions its package management system from `opkg` to Alpine Linux
 ## 🚀 Features
 
 - **No external dependencies:** Written in pure Python 3 using only standard libraries.
-- **Automatic Metadata Translation:** Converts `control` file properties into the required `.PKGINFO` format.
+- **Automatic Metadata Translation:** Converts `control` file properties into the required `.PKGINFO` format, including `Depends`, `Provides`, `Conflicts`, `Replaces`, `Homepage`, and `License`.
 - **Dependency Parsing:** Strips legacy version constraints and formats dependencies for `apk`.
 - **Install Script Mapping:** Automatically renames `preinst`/`postinst`/`prerm`/`postrm` to their APK equivalents (`.pre-install`, etc.).
 - **Strict APK v2 Compliance:** * Calculates and injects `APK-TOOLS.checksum.SHA1` into PAX extended headers for every data file.
