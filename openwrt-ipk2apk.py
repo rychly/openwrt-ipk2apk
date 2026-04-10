@@ -44,8 +44,7 @@ def format_dependencies(depends_str: str) -> List[str]:
         # Remove version constraints in parentheses, e.g., (>= 1.0)
         dep_expr = re.sub(r"\(.*?\)", "", dep_expr)
         # Split on '|' for alternatives, strip whitespace from each part
-        alternatives = [a.strip() for a in dep_expr.split("|")]
-        alternatives = [a for a in alternatives if a]
+        alternatives = [a.strip() for a in dep_expr.split("|") if a.strip()]
         if alternatives:
             result.append("|".join(alternatives))
     return result
