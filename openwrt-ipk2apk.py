@@ -35,18 +35,74 @@ def parse_control_file(control_path: str) -> Dict[str, str]:
     return metadata
 
 
+def _apk_dep_constraint(dep: str) -> str:
+    """Converts a single IPK dependency token to APK notation.
+
+    IPK/Debian uses parenthesised operators, e.g., 'pkg (>= 1.0)'.
+    APK uses inline operators without parentheses, e.g., 'pkg>=1.0'.
+
+    Operator mapping:
+      (= ver)  -> =ver   (exact)
+      (>= ver) -> >=ver
+      (<= ver) -> <=ver
+      (>> ver) -> >ver   (Debian strict-greater)
+      (<< ver) -> <ver   (Debian strict-less)
+      (> ver)  -> >ver   (OpenWrt style)
+      (< ver)  -> <ver   (OpenWrt style)
+    """
+    dep = dep.strip()
+    match = re.match(
+        r"^(\S+)\s*\(\s*(=|>=|<=|>>|<<|>|<)\s*([^)]+)\)$", dep
+    )
+    if not match:
+        return dep
+    pkg, op, ver = match.group(1).strip(), match.group(2), match.group(3).strip()
+    # Normalise Debian strict operators to their APK equivalents
+    apk_op = {">>": ">", "<<": "<"}.get(op, op)
+    return f"{pkg}{apk_op}{ver}"
+
+
 def format_dependencies(depends_str: str) -> List[str]:
-    """Removes version constraints and returns a list of dependency names for APK."""
+    """Converts IPK dependency expressions to APK notation.
+
+    Version constraints are translated to APK's inline format (e.g.,
+    'libssl (>= 1.1)' becomes 'libssl>=1.1').  OR-alternatives ('|') are
+    preserved.  Each comma-separated entry becomes one list element.
+    """
     if not depends_str:
         return []
     result = []
     for dep_expr in depends_str.split(","):
-        # Remove version constraints in parentheses, e.g., (>= 1.0)
-        dep_expr = re.sub(r"\(.*?\)", "", dep_expr)
-        # Split on '|' for alternatives, strip whitespace from each part
-        alternatives = [a.strip() for a in dep_expr.split("|") if a.strip()]
+        # Split on '|' for alternatives, convert each token individually
+        alternatives = [
+            _apk_dep_constraint(a) for a in dep_expr.split("|") if a.strip()
+        ]
         if alternatives:
             result.append("|".join(alternatives))
+    return result
+
+
+def format_provides(provides_str: str) -> List[str]:
+    """Converts IPK Provides into APK provides format.
+
+    APK supports versioned provides using '=' only (e.g., 'libfoo=1.0').
+    Exact-version constraints '(= <ver>)' are converted to that form via
+    _apk_dep_constraint(); all other version constraints are stripped because
+    APK does not support range operators in 'provides'.
+    """
+    if not provides_str:
+        return []
+    result = []
+    for item in provides_str.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        converted = _apk_dep_constraint(item)
+        # APK provides only support exact '=' version constraints; drop ranges
+        if re.search(r"[<>]", converted):
+            converted = re.sub(r"[<>].*$", "", converted).strip()
+        if converted:
+            result.append(converted)
     return result
 
 
@@ -85,10 +141,26 @@ def create_pkginfo_content(
 
     if "Maintainer" in metadata:
         pkginfo.append(f"maintainer = {metadata['Maintainer']}")
+    if "Homepage" in metadata:
+        pkginfo.append(f"url = {metadata['Homepage']}")
+    if "License" in metadata:
+        pkginfo.append(f"license = {metadata['License']}")
     if "Depends" in metadata:
         # APK requires one "depend = <name>" line per dependency
         for dep in format_dependencies(metadata["Depends"]):
             pkginfo.append(f"depend = {dep}")
+    if "Provides" in metadata:
+        # APK requires one "provides = <name>[=version]" line per provided package
+        for prov in format_provides(metadata["Provides"]):
+            pkginfo.append(f"provides = {prov}")
+    if "Conflicts" in metadata:
+        # APK uses "conflict" (singular) for package conflicts
+        for conf in format_dependencies(metadata["Conflicts"]):
+            pkginfo.append(f"conflict = {conf}")
+    if "Replaces" in metadata:
+        # APK requires one "replaces = <name>" line per replaced package
+        for repl in format_dependencies(metadata["Replaces"]):
+            pkginfo.append(f"replaces = {repl}")
 
     return "\n".join(pkginfo) + "\n"
 
