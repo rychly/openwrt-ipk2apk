@@ -16,9 +16,7 @@
         let
           lib = nixpkgs.lib;
           pkgs = nixpkgs.legacyPackages.${system};
-        in
-        {
-          default = pkgs.stdenv.mkDerivation {
+          openwrt-ipk2apk = pkgs.stdenv.mkDerivation {
             pname = "openwrt-ipk2apk";
             version = "1.0.0";
 
@@ -40,6 +38,32 @@
               mainProgram = "openwrt-ipk2apk";
             };
           };
+          apk-v2-to-v3-converter = pkgs.writeShellApplication {
+            name = "convert-apk-v2-to-v3";
+            runtimeInputs = with pkgs; [
+              apk-tools
+              coreutils
+              findutils
+              fakeroot
+              getopt
+              gnugrep
+              gnused
+              gnutar
+              gzip
+            ];
+            text = ''
+              exec fakeroot bash ${./convert-apk-v2-to-v3.sh} "$@"
+            '';
+            meta = with pkgs.lib; {
+              description = "Convert APK v2 (gzip-concatenated) to v3 (ADB container)";
+              license = licenses.mit;
+              mainProgram = "convert-apk-v2-to-v3";
+            };
+          };
+        in
+        {
+          inherit openwrt-ipk2apk apk-v2-to-v3-converter;
+          default = openwrt-ipk2apk;
         }
       );
 

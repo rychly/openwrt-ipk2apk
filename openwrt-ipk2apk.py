@@ -51,9 +51,7 @@ def _apk_dep_constraint(dep: str) -> str:
       (< ver)  -> <ver   (OpenWrt style)
     """
     dep = dep.strip()
-    match = re.match(
-        r"^(\S+)\s*\(\s*(=|>=|<=|>>|<<|>|<)\s*([^)]+)\)$", dep
-    )
+    match = re.match(r"^(\S+)\s*\(\s*(=|>=|<=|>>|<<|>|<)\s*([^)]+)\)$", dep)
     if not match:
         return dep
     pkg, op, ver = match.group(1).strip(), match.group(2), match.group(3).strip()
@@ -221,9 +219,7 @@ def convert_package(ipk_file: str, apk_file: str) -> None:
             with tarfile.open(ipk_file, "r:gz") as ipk:
                 ipk.extractall(path=tmpdir, **extract_kwargs)
         except tarfile.ReadError as e:
-            raise ValueError(
-                "The source file is not a valid tar.gz archive."
-            ) from e
+            raise ValueError("The source file is not a valid tar.gz archive.") from e
 
         control_tar_path = os.path.join(tmpdir, "control.tar.gz")
         orig_data_tar_path = os.path.join(tmpdir, "data.tar.gz")
